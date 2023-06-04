@@ -9,8 +9,8 @@ import os
 PRETRAINED_MODEL_NAME: str = "distilbert-base-uncased"
 TRAINING_DATASET_PATH: str = "data/rotten_tomatoes_critic_reviews.csv"
 MODEL_OUTPUT_PATH: str = "./tuned_model"
-EPOCHS: int = 5
-DATASET_ROWS_LIMIT: int = 30000
+EPOCHS: int = 3
+DATASET_ROWS_LIMIT: int = 100000
 RANDOM_STATE: int = 42
 
 
@@ -21,6 +21,7 @@ def load_dataset(file_path: str) -> pd.DataFrame:
             zip_file.extractall("./data")
 
     df = pd.read_csv(file_path)
+    df = df[["review_content", "review_score"]]
     df = df.dropna(subset=["review_content", "review_score"])
     return df.sample(DATASET_ROWS_LIMIT, random_state=RANDOM_STATE)
 
@@ -38,7 +39,9 @@ def preprocess_dataset(df: pd.DataFrame, tokenizer: AutoTokenizer) -> Tuple[dict
         df["review_content"].tolist(),
         truncation=True,
         padding=True,
-        max_length=512,
+        max_length=256,
+        add_special_tokens=True,
+        return_attention_mask=True,
     )
     labels = normalized_scores.apply(
         lambda x: 2 if x > 0.6 else (1 if 0.5 <= x <= 0.6 else 0)
@@ -47,35 +50,59 @@ def preprocess_dataset(df: pd.DataFrame, tokenizer: AutoTokenizer) -> Tuple[dict
 
 
 def split_dataset(inputs: dict, labels: list) -> Tuple:
-    train_inputs, test_inputs, train_labels, test_labels = train_test_split(
-        inputs["input_ids"], labels, test_size=0.2, random_state=RANDOM_STATE
+    (
+        train_inputs,
+        test_inputs,
+        train_mask,
+        test_mask,
+        train_labels,
+        test_labels,
+    ) = train_test_split(
+        inputs["input_ids"],
+        inputs["attention_mask"],
+        labels,
+        test_size=0.3,
+        random_state=RANDOM_STATE,
     )
+
     train_dataset = tf.data.Dataset.from_tensor_slices(
-        (dict(input_ids=train_inputs), train_labels)
+        (
+            dict(input_ids=train_inputs, attention_mask=train_mask),
+            train_labels,
+        )
     )
     test_dataset = tf.data.Dataset.from_tensor_slices(
-        (dict(input_ids=test_inputs), test_labels)
+        (
+            dict(input_ids=test_inputs, attention_mask=test_mask),
+            test_labels,
+        )
     )
+
     return train_dataset, test_dataset
 
 
 def train_model(
-    train_dataset: tf.data.Dataset, test_dataset: tf.data.Dataset
+    train_dataset: tf.data.Dataset,
+    test_dataset: tf.data.Dataset,
 ) -> TFAutoModelForSequenceClassification:
     model = TFAutoModelForSequenceClassification.from_pretrained(
-        PRETRAINED_MODEL_NAME, num_labels=3
+        PRETRAINED_MODEL_NAME, num_labels=3, dropout=0.3, attention_dropout=0.3
     )
     batch_size = 32
-    optimizer = tf.keras.optimizers.Adam(learning_rate=2e-5)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=2e-5, weight_decay=0.01)
     loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
     metrics = ["accuracy"]
+    early_stopping_callback = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss", patience=2, restore_best_weights=True
+    )
 
     model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
     model.fit(
         train_dataset.shuffle(1000).batch(batch_size),
         epochs=EPOCHS,
         batch_size=batch_size,
-        validation_data=test_dataset.shuffle(1000).batch(batch_size),
+        validation_data=test_dataset.batch(batch_size),
+        callbacks=[early_stopping_callback],
     )
     return model
 
